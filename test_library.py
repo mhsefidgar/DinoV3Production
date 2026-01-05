@@ -84,8 +84,13 @@ def test_workflow():
     # 7. Hub & Text
     print("\n[7] Testing Hub/DinoTxt")
     try:
+    try:
         txt_model, tok = dinotxt.dinov3_vitl16_dinotxt_tet1280d20h24l()
-        print("DinoTxt loaded successfully.")
+        print("DinoTxt Large loaded successfully.")
+        
+        # Test new VITS14 variant
+        txt_model_s, tok_s = dinotxt.dinov3_vits14_dinotxt_swiglu_highres()
+        print("DinoTxt Small (Colab) loaded successfully.")
     except Exception as e:
         print(f"DinoTxt failed: {e}")
 

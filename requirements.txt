@@ -1,9 +1,0 @@
-torch>=2.0.0
-timm
-transformers
-peft
-torchao
-onnx
-onnxruntime
-albumentations
-huggingface_hub

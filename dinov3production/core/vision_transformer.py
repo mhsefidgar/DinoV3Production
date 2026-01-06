@@ -46,19 +46,23 @@ class RotaryEmbedding(nn.Module):
 def apply_rotary_pos_emb(q, k, freqs):
     """
     Apply RoPE safely, matching q/k head_dim to freqs.
+    q, k: [B, num_heads, N, head_dim]
+    freqs: [1, N, 1, D] from RotaryEmbedding
     """
-    head_dim = q.shape[-1]
+    B, H, N, head_dim = q.shape
     rope_dim = freqs.shape[-1]
 
-    # if head_dim != rope_dim, split q/k
-    if rope_dim * 2 != head_dim:
-        # Split into rotary part and passthrough
-        q_rot, q_pass = q[..., :rope_dim], q[..., rope_dim:]
-        k_rot, k_pass = k[..., :rope_dim], k[..., rope_dim:]
-    else:
-        q_rot, q_pass = q, None
-        k_rot, k_pass = k, None
+    # Crop or expand freqs to match head_dim
+    if rope_dim != head_dim:
+        if rope_dim > head_dim:
+            freqs = freqs[..., :head_dim]  # crop if bigger
+        else:
+            # repeat to fill head_dim
+            reps = head_dim // rope_dim
+            freqs = freqs.repeat(1, 1, 1, reps)
 
+    # reshape freqs to match q/k shape
+    freqs = freqs.permute(0, 2, 1, 3)  # [1, 1, N, head_dim]
     cos = freqs.cos().to(q.dtype)
     sin = freqs.sin().to(q.dtype)
 
@@ -66,16 +70,10 @@ def apply_rotary_pos_emb(q, k, freqs):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat((-x2, x1), dim=-1)
 
-    q_rot = q_rot * cos + rotate_half(q_rot) * sin
-    k_rot = k_rot * cos + rotate_half(k_rot) * sin
+    q_rot = q * cos + rotate_half(q) * sin
+    k_rot = k * cos + rotate_half(k) * sin
+    return q_rot, k_rot
 
-    if q_pass is not None:
-        q_embed = torch.cat([q_rot, q_pass], dim=-1)
-        k_embed = torch.cat([k_rot, k_pass], dim=-1)
-    else:
-        q_embed, k_embed = q_rot, k_rot
-
-    return q_embed, k_embed
 # -----------------------------------------------------------
 
 class Attention(nn.Module):
@@ -252,3 +250,4 @@ class DinoV3VisionTransformer(nn.Module):
         x = self.forward_features(x)
         x = self.forward_head(x)
         return x
+

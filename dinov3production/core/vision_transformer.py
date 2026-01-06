@@ -23,52 +23,60 @@ class PatchEmbed(nn.Module):
         return x
 
 class RotaryEmbedding(nn.Module):
-    """
-    2D Axial Rotary Positional Embedding.
-    """
+    """ 2D Axial Rotary Positional Embedding """
     def __init__(self, dim, max_resolution=224, base=10000):
         super().__init__()
         self.dim = dim
         self.base = base
         
     def forward(self, x, H, W):
-        # x: [B, N, heads, head_dim] (or similar, depending on where applied)
         device = x.device
-        
-        # 1D freqs
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim // 4, 2, device=device).float() / (self.dim // 4)))
-        
         t_h = torch.arange(H, device=device, dtype=inv_freq.dtype)
         t_w = torch.arange(W, device=device, dtype=inv_freq.dtype)
-        
-        freqs_h = torch.outer(t_h, inv_freq) # [H, D/4]
-        freqs_w = torch.outer(t_w, inv_freq) # [W, D/4]
-        
-        # Construct grid
-        freqs_h = freqs_h.unsqueeze(1).repeat(1, W, 1) # [H, W, D/4]
-        freqs_w = freqs_w.unsqueeze(0).repeat(H, 1, 1) # [H, W, D/4]
-        
-        freqs = torch.cat([freqs_h, freqs_w], dim=-1).flatten(0, 1) # [H*W, D/2]
-        
-        # Complex rope (sin/cos split style)
-        freqs = torch.cat([freqs, freqs], dim=-1) # [H*W, D] 
-        
-        return freqs.unsqueeze(0).unsqueeze(2) # [1, N, 1, D]
+        freqs_h = torch.outer(t_h, inv_freq)
+        freqs_w = torch.outer(t_w, inv_freq)
+        freqs_h = freqs_h.unsqueeze(1).repeat(1, W, 1)
+        freqs_w = freqs_w.unsqueeze(0).repeat(H, 1, 1)
+        freqs = torch.cat([freqs_h, freqs_w], dim=-1).flatten(0, 1)
+        freqs = torch.cat([freqs, freqs], dim=-1)
+        return freqs.unsqueeze(0).unsqueeze(2)  # [1, N, 1, D]
 
+# -------------------- MINIMAL FIX HERE --------------------
 def apply_rotary_pos_emb(q, k, freqs):
-    # Sin/Cos injection
+    """
+    Apply RoPE safely, matching q/k head_dim to freqs.
+    """
+    head_dim = q.shape[-1]
+    rope_dim = freqs.shape[-1]
+
+    # if head_dim != rope_dim, split q/k
+    if rope_dim * 2 != head_dim:
+        # Split into rotary part and passthrough
+        q_rot, q_pass = q[..., :rope_dim], q[..., rope_dim:]
+        k_rot, k_pass = k[..., :rope_dim], k[..., rope_dim:]
+    else:
+        q_rot, q_pass = q, None
+        k_rot, k_pass = k, None
+
     cos = freqs.cos().to(q.dtype)
     sin = freqs.sin().to(q.dtype)
-    
-    # Rotate half helper
+
     def rotate_half(x):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat((-x2, x1), dim=-1)
 
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    q_rot = q_rot * cos + rotate_half(q_rot) * sin
+    k_rot = k_rot * cos + rotate_half(k_rot) * sin
 
+    if q_pass is not None:
+        q_embed = torch.cat([q_rot, q_pass], dim=-1)
+        k_embed = torch.cat([k_rot, k_pass], dim=-1)
+    else:
+        q_embed, k_embed = q_rot, k_rot
+
+    return q_embed, k_embed
+# -----------------------------------------------------------
 
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., use_rope=False):
@@ -89,14 +97,11 @@ class Attention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         if self.use_rope and rope_freqs is not None:
-             # rope_freqs: [1, n_patches, 1, D]
             n_special = N - rope_freqs.shape[1]
             if n_special > 0:
                 q_spatial, k_spatial = q[:, n_special:], k[:, n_special:]
                 q_special, k_special = q[:, :n_special], k[:, :n_special]
-                
                 q_spatial, k_spatial = apply_rotary_pos_emb(q_spatial, k_spatial, rope_freqs)
-                
                 q = torch.cat([q_special, q_spatial], dim=1)
                 k = torch.cat([k_special, k_spatial], dim=1)
             else:
@@ -116,7 +121,6 @@ class SwiGLU(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        
         self.w1 = nn.Linear(in_features, hidden_features, bias=bias)
         self.w2 = nn.Linear(in_features, hidden_features, bias=bias)
         self.act = act_layer()
@@ -171,9 +175,6 @@ class Block(nn.Module):
         return x
 
 class DinoV3VisionTransformer(nn.Module):
-    """
-    DINOv3 Vision Transformer with RoPE, SwiGLU, and Register Tokens.
-    """
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, 
                  embed_dim=768, depth=12, num_heads=12, mlp_ratio=4., qkv_bias=True, 
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., 
@@ -187,78 +188,60 @@ class DinoV3VisionTransformer(nn.Module):
 
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim, norm_layer=norm_layer)
-        num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.register_tokens = nn.Parameter(torch.zeros(1, num_register_tokens, embed_dim))
         
         if not use_rope:
-            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1 + num_register_tokens, embed_dim))
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patches + 1 + num_register_tokens, embed_dim))
         else:
             self.pos_embed = None
             self.rope = RotaryEmbedding(embed_dim // num_heads)
             
         self.pos_drop = nn.Dropout(p=drop_rate)
-
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList([
-            Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, 
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                use_rope=use_rope, use_swiglu=use_swiglu)
-            for i in range(depth)])
+            Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, 
+                  drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
+                  use_rope=use_rope, use_swiglu=use_swiglu) for i in range(depth)])
         self.norm = norm_layer(embed_dim)
-
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-        if self.pos_embed is not None:
-            nn.init.trunc_normal_(self.pos_embed, std=.02)
         nn.init.trunc_normal_(self.cls_token, std=.02)
         nn.init.trunc_normal_(self.register_tokens, std=.02)
+        if self.pos_embed is not None:
+            nn.init.trunc_normal_(self.pos_embed, std=.02)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
+            if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-    
-    def get_class_and_patch_tokens(self, x):
-        """
-        Helper for compatibility with DinoTxt code.
-        """
-        tokens = self.forward_features(x)
-        cls_token = tokens[:, 0:1]
-        patch_tokens = tokens[:, 1+self.num_register_tokens:]
-        return cls_token, None, patch_tokens
 
     def forward_features(self, x):
         B, C, H, W = x.shape
-        x = self.patch_embed(x) # [B, N, D]
+        x = self.patch_embed(x)
         
         rope_freqs = None
         if self.use_rope:
             h_patches = H // self.patch_embed.patch_size
             w_patches = W // self.patch_embed.patch_size
-            rope_freqs = self.rope(x, h_patches, w_patches) 
+            rope_freqs = self.rope(x, h_patches, w_patches)
 
         cls_tokens = self.cls_token.expand(B, -1, -1)
         register_tokens = self.register_tokens.expand(B, -1, -1)
-        
         x = torch.cat((cls_tokens, register_tokens, x), dim=1)
-        
-        if self.pos_embed is not None:
-             if x.shape[1] == self.pos_embed.shape[1]:
-                 x = x + self.pos_embed
-        
-        x = self.pos_drop(x)
 
+        if self.pos_embed is not None and x.shape[1] == self.pos_embed.shape[1]:
+            x = x + self.pos_embed
+
+        x = self.pos_drop(x)
         for blk in self.blocks:
             x = blk(x, rope_freqs=rope_freqs)
-
         x = self.norm(x)
         return x
 
